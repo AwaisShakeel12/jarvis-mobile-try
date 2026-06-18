@@ -4,10 +4,9 @@ import traceback
 import json
 import time
 import base64
-import tempfile
 from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -19,7 +18,11 @@ from google.genai import types
 
 load_dotenv()
 
-app = FastAPI(title="JARVIS Voice API", description="Voice-to-Voice API for Mobile")
+app = FastAPI(
+    title="JARVIS Voice API", 
+    description="Voice-to-Voice API for Mobile Apps",
+    version="1.0.0"
+)
 
 # CORS for mobile apps
 app.add_middleware(
@@ -163,10 +166,10 @@ def save_memory(category: str, key: str, value: str):
     return {"result": "ok", "silent": True}
 
 def web_search(query: str):
-    return f"🔍 Searching for: {query}"
+    return f"Searching for: {query}"
 
 def weather_report(city: str):
-    return f"☀️ Weather report for {city}"
+    return f"Weather report for {city}"
 
 TOOLS = {
     "add_numbers": add_numbers,
@@ -181,10 +184,6 @@ TOOLS = {
 class TextCommand(BaseModel):
     text: str
     session_id: Optional[str] = None
-
-class AudioChunk(BaseModel):
-    audio: str  # base64 encoded PCM audio
-    session_id: str
 
 class SessionCreate(BaseModel):
     user_id: Optional[str] = None
@@ -436,7 +435,8 @@ RECENT CONTEXT:
         traceback.print_exc()
     finally:
         # Cleanup
-        session.active = False
+        if session:
+            session.active = False
         for task in [send_task, receive_task, keepalive_task]:
             if task and not task.done():
                 task.cancel()
@@ -455,14 +455,15 @@ RECENT CONTEXT:
 # --- REST API ENDPOINTS ---
 
 @app.post("/api/session/create")
-async def create_session(data: SessionCreate):
+async def create_session(data: SessionCreate = None):
     """Create a new voice session"""
     session = await get_or_create_session()
-    return {
+    return JSONResponse({
         "status": "success",
         "session_id": session.session_id,
-        "created_at": session.created_at
-    }
+        "created_at": session.created_at,
+        "message": "Session created successfully"
+    })
 
 @app.post("/api/session/close/{session_id}")
 async def close_session(session_id: str):
@@ -471,75 +472,14 @@ async def close_session(session_id: str):
         if session_id in sessions:
             sessions[session_id].active = False
             del sessions[session_id]
-            return {"status": "success", "message": f"Session {session_id} closed"}
-    return {"status": "error", "message": "Session not found"}
-
-@app.post("/api/voice/process")
-async def process_audio(audio: UploadFile = File(...), session_id: Optional[str] = None):
-    """Process audio file (for non-realtime use)"""
-    try:
-        # Read audio data
-        audio_data = await audio.read()
-        
-        # Get or create session
-        session = await get_or_create_session(session_id)
-        
-        # Process with Gemini
-        memory = load_memory()
-        mem_str = format_memory_for_prompt(memory)
-        
-        system_prompt = f"""You are JARVIS. Be concise and professional.
-        
-MEMORY:
-{mem_str}
-"""
-        
-        config = types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            system_instruction=system_prompt,
-            tools=[{"function_declarations": TOOL_DECLARATIONS}],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Charon")
-                )
-            )
-        )
-        
-        # Process with Gemini
-        results = []
-        async with client.aio.live.connect(model=LIVE_MODEL, config=config) as gemini_session:
-            await gemini_session.send(input={"data": audio_data, "mime_type": "audio/pcm"})
-            
-            async for response in gemini_session.receive():
-                server_content = response.server_content
-                if server_content is not None:
-                    model_turn = server_content.model_turn
-                    if model_turn is not None:
-                        for part in model_turn.parts:
-                            if part.text:
-                                results.append({
-                                    "type": "text",
-                                    "content": part.text
-                                })
-                            if part.inline_data and part.inline_data.data:
-                                # Convert audio to base64
-                                audio_base64 = base64.b64encode(part.inline_data.data).decode('utf-8')
-                                results.append({
-                                    "type": "audio",
-                                    "data": audio_base64
-                                })
-        
-        return {
-            "status": "success",
-            "session_id": session.session_id,
-            "results": results
-        }
-        
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e)}
-        )
+            return JSONResponse({
+                "status": "success", 
+                "message": f"Session {session_id} closed"
+            })
+    return JSONResponse(
+        status_code=404,
+        content={"status": "error", "message": "Session not found"}
+    )
 
 @app.post("/api/text/command")
 async def text_command(data: TextCommand):
@@ -567,11 +507,11 @@ Response:"""
         session.add_to_context(f"User: {data.text}")
         session.add_to_context(f"JARVIS: {response.text}")
         
-        return {
+        return JSONResponse({
             "status": "success",
             "session_id": session.session_id,
             "response": response.text
-        }
+        })
     except Exception as e:
         return JSONResponse(
             status_code=500,
@@ -583,303 +523,50 @@ async def get_session_status(session_id: str):
     """Get session status"""
     if session_id in sessions:
         session = sessions[session_id]
-        return {
+        return JSONResponse({
             "status": "active",
             "session_id": session_id,
             "created_at": session.created_at,
             "last_activity": session.last_activity,
             "context_length": len(session.context),
             "active": session.active
-        }
-    return {"status": "inactive", "session_id": session_id}
+        })
+    return JSONResponse({
+        "status": "inactive", 
+        "session_id": session_id
+    })
 
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint"""
-    return {
+    return JSONResponse({
         "status": "healthy",
         "active_sessions": len(sessions),
-        "timestamp": time.time()
-    }
+        "timestamp": time.time(),
+        "version": "1.0.0"
+    })
 
-# --- SIMPLE WEB UI FOR TESTING ---
-@app.get("/")
-async def get_ui():
-    html = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>JARVIS API Test</title>
-    <style>
-        body {
-            background: #0a0a0a;
-            color: #00d4ff;
-            font-family: 'Courier New', monospace;
-            padding: 20px;
-            max-width: 800px;
-            margin: 0 auto;
-        }
-        h1 { color: #00d4ff; text-shadow: 0 0 20px rgba(0,212,255,0.3); }
-        .status { padding: 10px; border: 1px solid #00d4ff; border-radius: 5px; margin: 10px 0; }
-        .online { color: #00ff88; }
-        .offline { color: #ff3355; }
-        button {
-            background: #0a0a0a;
-            border: 1px solid #00d4ff;
-            color: #00d4ff;
-            padding: 10px 20px;
-            cursor: pointer;
-            font-family: 'Courier New', monospace;
-            margin: 5px;
-        }
-        button:hover {
-            background: #001a2a;
-        }
-        input, textarea {
-            background: #0a0a0a;
-            border: 1px solid #00d4ff;
-            color: #00ff88;
-            padding: 10px;
-            width: 100%;
-            font-family: 'Courier New', monospace;
-            margin: 5px 0;
-        }
-        .log {
-            background: #050505;
-            border: 1px solid #0d3347;
-            padding: 10px;
-            height: 300px;
-            overflow-y: auto;
-            color: #8ffcff;
-            font-size: 0.9em;
-            margin: 10px 0;
-        }
-        .log .user { color: #ffaa00; }
-        .log .jarvis { color: #00d4ff; }
-        .log .system { color: #ffcc00; }
-        .log .error { color: #ff3355; }
-        .endpoints {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 10px;
-            margin: 20px 0;
-        }
-        .endpoint {
-            background: #0a0a0a;
-            border: 1px solid #0d3347;
-            padding: 10px;
-            border-radius: 5px;
-        }
-        .endpoint .method { color: #00ff88; font-weight: bold; }
-        .endpoint .path { color: #00d4ff; }
-        .endpoint .desc { color: #5ab8cc; font-size: 0.8em; }
-    </style>
-</head>
-<body>
-    <h1>🔊 JARVIS Voice API</h1>
-    
-    <div class="status" id="status">
-        <span class="offline">● OFFLINE</span>
-        <span id="sessionInfo">No session</span>
-    </div>
-    
-    <div>
-        <button onclick="createSession()">Create Session</button>
-        <button onclick="closeSession()">Close Session</button>
-    </div>
-    
-    <h3>Text Command</h3>
-    <div style="display:flex; gap:10px;">
-        <input type="text" id="textInput" placeholder="Type a command..." style="flex:1;">
-        <button onclick="sendText()">Send</button>
-    </div>
-    
-    <h3>WebSocket Test</h3>
-    <button onclick="connectWS()">Connect WebSocket</button>
-    <button onclick="sendTestAudio()">Send Test Audio</button>
-    
-    <h3>Log</h3>
-    <div class="log" id="log">Awaiting commands...</div>
-    
-    <h3>API Endpoints</h3>
-    <div class="endpoints">
-        <div class="endpoint">
-            <div><span class="method">POST</span> <span class="path">/api/session/create</span></div>
-            <div class="desc">Create new voice session</div>
-        </div>
-        <div class="endpoint">
-            <div><span class="method">POST</span> <span class="path">/api/text/command</span></div>
-            <div class="desc">Send text command</div>
-        </div>
-        <div class="endpoint">
-            <div><span class="method">WS</span> <span class="path">/ws/voice</span></div>
-            <div class="desc">Real-time voice WebSocket</div>
-        </div>
-        <div class="endpoint">
-            <div><span class="method">POST</span> <span class="path">/api/voice/process</span></div>
-            <div class="desc">Upload audio file</div>
-        </div>
-    </div>
-    
-    <script>
-        let sessionId = null;
-        let ws = null;
-        const logEl = document.getElementById('log');
-        const statusEl = document.getElementById('status');
-        
-        function updateLog(text, type = 'system') {
-            const cls = type === 'user' ? 'user' : 
-                       type === 'jarvis' ? 'jarvis' : 
-                       type === 'error' ? 'error' : 'system';
-            logEl.innerHTML += `<div class="${cls}">${text}</div>`;
-            logEl.scrollTop = logEl.scrollHeight;
-        }
-        
-        function updateStatus(status, text) {
-            const statusText = status === 'online' ? '● ONLINE' : '● OFFLINE';
-            const cls = status === 'online' ? 'online' : 'offline';
-            statusEl.innerHTML = `<span class="${cls}">${statusText}</span> <span id="sessionInfo">${text}</span>`;
-        }
-        
-        async function createSession() {
-            try {
-                const response = await fetch('/api/session/create', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({})
-                });
-                const data = await response.json();
-                sessionId = data.session_id;
-                updateStatus('online', `Session: ${sessionId}`);
-                updateLog(`Session created: ${sessionId}`, 'system');
-            } catch (e) {
-                updateLog(`Error: ${e.message}`, 'error');
-            }
-        }
-        
-        async function closeSession() {
-            if (!sessionId) return;
-            try {
-                await fetch(`/api/session/close/${sessionId}`, {method: 'POST'});
-                sessionId = null;
-                updateStatus('offline', 'No session');
-                updateLog('Session closed', 'system');
-            } catch (e) {
-                updateLog(`Error: ${e.message}`, 'error');
-            }
-        }
-        
-        async function sendText() {
-            const input = document.getElementById('textInput');
-            const text = input.value.trim();
-            if (!text) return;
-            if (!sessionId) {
-                updateLog('Create a session first!', 'error');
-                return;
-            }
-            
-            input.value = '';
-            updateLog(`You: ${text}`, 'user');
-            
-            try {
-                const response = await fetch('/api/text/command', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({text, session_id: sessionId})
-                });
-                const data = await response.json();
-                if (data.response) {
-                    updateLog(`JARVIS: ${data.response}`, 'jarvis');
-                } else {
-                    updateLog(`Error: ${data.message || 'Unknown error'}`, 'error');
-                }
-            } catch (e) {
-                updateLog(`Error: ${e.message}`, 'error');
-            }
-        }
-        
-        async function connectWS() {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.close();
-                ws = null;
-                updateLog('WebSocket disconnected', 'system');
-                return;
-            }
-            
-            ws = new WebSocket(`ws://${window.location.host}/ws/voice`);
-            
-            ws.onopen = () => {
-                updateLog('WebSocket connected', 'system');
-                // Send session ID if exists
-                if (sessionId) {
-                    ws.send(JSON.stringify({session_id: sessionId}));
-                }
-            };
-            
-            ws.onmessage = (event) => {
-                if (typeof event.data === 'string') {
-                    try {
-                        const msg = JSON.parse(event.data);
-                        if (msg.type === 'session') {
-                            sessionId = msg.session_id;
-                            updateStatus('online', `Session: ${sessionId}`);
-                            updateLog(`Session assigned: ${sessionId}`, 'system');
-                        } else if (msg.type === 'text') {
-                            updateLog(`JARVIS: ${msg.content}`, 'jarvis');
-                        } else if (msg.type === 'tool') {
-                            updateLog(`[TOOL] ${msg.name}: ${JSON.stringify(msg.args)}`, 'system');
-                        } else if (msg.type === 'ping') {
-                            // Respond to ping
-                            ws.send(JSON.stringify({type: 'pong'}));
-                        }
-                    } catch (e) {
-                        updateLog(`Message: ${event.data}`, 'system');
-                    }
-                } else if (event.data instanceof ArrayBuffer) {
-                    // Audio data - can't display
-                    updateLog('📢 Audio received', 'system');
-                }
-            };
-            
-            ws.onerror = (error) => {
-                updateLog(`WebSocket error: ${error}`, 'error');
-            };
-            
-            ws.onclose = () => {
-                updateLog('WebSocket closed', 'system');
-            };
-        }
-        
-        async function sendTestAudio() {
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                updateLog('Connect WebSocket first!', 'error');
-                return;
-            }
-            
-            // Generate test audio (simple beep)
-            const sampleRate = 16000;
-            const duration = 0.5; // seconds
-            const samples = Math.floor(duration * sampleRate);
-            const audioData = new Int16Array(samples);
-            
-            // Generate a sine wave at 440Hz
-            for (let i = 0; i < samples; i++) {
-                audioData[i] = Math.floor(0.5 * 32767 * Math.sin(2 * Math.PI * 440 * i / sampleRate));
-            }
-            
-            ws.send(audioData.buffer);
-            updateLog('🎙 Test audio sent', 'system');
-        }
-        
-        // Enter key for text input
-        document.getElementById('textInput').addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') sendText();
-        });
-    </script>
-</body>
-</html>
-    """
-    return HTMLResponse(content=html)
+@app.get("/api/memory")
+async def get_memory():
+    """Get all user memory (for debugging)"""
+    return JSONResponse({
+        "status": "success",
+        "memory": load_memory()
+    })
+
+@app.delete("/api/memory/{category}")
+async def clear_memory_category(category: str):
+    """Clear a memory category"""
+    if category in user_memory:
+        user_memory[category] = {}
+        return JSONResponse({
+            "status": "success",
+            "message": f"Cleared {category} memory"
+        })
+    return JSONResponse(
+        status_code=404,
+        content={"status": "error", "message": "Category not found"}
+    )
 
 if __name__ == "__main__":
     uvicorn.run(
